@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>애플페이 가맹점 찾기</title>
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="styles.css" />
+  <meta name="color-scheme" content="light" />
+  <style>
+    html,body,#map{height:100%;margin:0}
+    .topbar{ position:absolute; z-index:500; left:50%; transform:translateX(-50%);
+      top:.8rem; display:flex; gap:.5rem; align-items:center; background:#fff;
+      border:1px solid #e5e7eb; border-radius:999px; padding:.45rem .6rem; box-shadow:0 2px 10px rgba(0,0,0,.06);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    }
+    .brand{ font-weight:700; margin:0 .4rem; }
+    .search-box{ display:flex; gap:.4rem; align-items:center; }
+    .search-box input{ width:16rem; max-width:40vw; padding:.45rem .7rem; border:1px solid #e5e7eb; border-radius:999px; }
+    .search-box button, .actions button{ padding:.45rem .6rem; border:1px solid #e5e7eb; border-radius:999px; background:#f8f8f8; }
+    .actions{ display:flex; gap:.3rem; margin-left:.3rem; }
+    @media (max-width:600px){ .search-box input{ width:12rem; } }
+
+    /* 마커/팝업 */
+    .ap-pin .pin{ font-size:22px; line-height:22px; transform:translate(-2px,-2px); }
+    .popup{ font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:14px; }
+    .popup .title{ font-weight:700; margin-bottom:4px; }
+    .popup .row{ margin:2px 0; }
+    .popup .muted{ color:#6b7280; }
+
+    /* 토스트 */
+    .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:1rem;background:#111;color:#fff;padding:.5rem .75rem;border-radius:.6rem;opacity:0;transition:opacity .2s;z-index:600}
+    .toast.show{opacity:.92}
+  </style>
+</head>
+<body>
+  <!-- Topbar -->
+  <div class="topbar" role="banner">
+    <div class="brand">애플페이 가맹점 찾기</div>
+    <div class="search-box" role="search">
+      <input id="search" placeholder="상호/브랜드 검색 (예: 스타벅스, GS25)" aria-label="검색어" />
+      <button id="search-submit" aria-label="검색">🔎</button>
+    </div>
+    <div class="actions">
+      <button id="btn-geoloc" title="내 위치" aria-label="내 위치">📍</button>
+      <button id="btn-scan" title="현재 화면 재스캔" aria-label="현재 화면 재스캔">🧭</button>
+      <button id="btn-add" title="가맹점 추가(GitHub)" aria-label="가맹점 추가">➕</button>
+      <button id="btn-center" title="원주 터미널로" aria-label="원주 터미널로">🎯</button>
+    </div>
+  </div>
+
+  <!-- 지도 -->
+  <div id="map" role="region" aria-label="Myapplepaymaps"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+  // =========================
+  // Config
+  // =========================
+  const CFG = {
+    OWNER:'diligencefrozen', REPO:'myapplepaymaps', ISSUE_LABEL:'add-merchant',
+    CENTER:[37.345040,127.930825], // 원주종합버스터미널 (지오로케이션 실패시)
+    INIT_ZOOM: 15,
+    LIMIT: 2000,       // Overpass out limit
+    OVERPASS: [
+      'https://overpass-api.de/api/interpreter',
+      'https://overpass.kumi.systems/api/interpreter',
+      'https://overpass.osm.ch/api/interpreter'
+    ]
+  };
+
+  // ✅ "애플페이 지원 가맹점"으로 노출할 브랜드만 정의
+  const APPLE_BRANDS = [
+    { id:'gs25', label:'편의점', icon:'🛒',
+      brandRE: /(gs ?25|지에스 ?25)/i, nameRE: /(gs ?25|지에스 ?25)/i, filter:{ shop:'convenience' } },
+    { id:'starbucks', label:'카페', icon:'☕',
+      brandRE: /(starbucks|스타벅스)/i, nameRE: /(starbucks|스타벅스)/i, filter:{ amenity:'cafe' } }
+    // 추가 예) CU
+    // { id:'cu', label:'편의점', icon:'🛒', brandRE:/\bcu\b|씨유/i, nameRE:/\bcu\b|씨유/i, filter:{ shop:'convenience' } }
+  ];
+
+  // =========================
+  // Helpers
+  // =========================
+  const $ = (s,r=document)=>r.querySelector(s);
+  const esc = s=>String(s||'').replace(/[&<>"']/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;' }[m]));
+  function toast(msg){ const el=document.body.appendChild(Object.assign(document.createElement('div'),{className:'toast',textContent:msg})); setTimeout(()=>el.classList.add('show')); setTimeout(()=>{el.classList.remove('show'); setTimeout(()=>el.remove(),300)},2000); }
+  function iconFor(icon){ return L.divIcon({ className:'ap-pin', html:`<div class="pin">${icon}</div>` }); }
+
+  // 주소 조합 (OSM 태그 → 문자열)
+  function addrFromTags(tags={}){
+    if(tags['addr:full']) return tags['addr:full'];
+    const parts = [
+      tags['addr:postcode'],
+      tags['addr:province']||tags['addr:state']||tags['addr:region'],
+      tags['addr:city']||tags['addr:town']||tags['addr:county']||tags['addr:district'],
+      tags['addr:suburb']||tags['addr:neighbourhood']||tags['addr:quarter'],
+      tags['addr:street']||tags['addr:road'],
+      tags['addr:door']||tags['addr:block'],
+      tags['addr:housenumber']||tags['addr:house_number']
+    ].filter(Boolean);
+    return parts.join(' ').replace(/\s+/g,' ').trim();
+  }
+
+  // Overpass 호출 (여러 엔드포인트 폴백)
+  async function fetchOverpass(query){
+    let lastErr;
+    for(const ep of CFG.OVERPASS){
+      try{
+        const res = await fetch(ep, { method:'POST', body:new URLSearchParams({ data: query }) });
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        return await res.json();
+      }catch(e){ lastErr = e; }
+    }
+    throw lastErr || new Error('Overpass failed');
+  }
+
+  // 브랜드 → Overpass 서브쿼리(nwr + out center 지원)
+  function brandToOverpassSub(br, bbox){
+    const [s,w,n,e] = bbox;
+    const filt = br.filter || {};
+    const tagPairs = Object.entries(filt).map(([k,v])=>`["${k}"="${v}"]`).join('');
+    const brandRE = br.brandRE ? br.brandRE.toString().replace(/^\/|\/[a-z]*$/g,'') : '';
+    const nameRE  = br.nameRE  ? br.nameRE.toString().replace(/^\/|\/[a-z]*$/g,'')  : '';
+    const parts = [];
+    if(brandRE){
+      parts.push(`nwr${tagPairs}["brand"~"${brandRE}",i](${s},${w},${n},${e});`);
+    }
+    if(nameRE){
+      parts.push(`nwr${tagPairs}["name"~"${nameRE}",i](${s},${w},${n},${e});`);
+    }
+    return parts.join('\n');
+  }
+
+  // 현재 화면(BBox) 안에서 애플페이 브랜드들만 조회
+  function buildQueryForBrands(bounds){
+    const s = bounds.getSouth(), w = bounds.getWest(), n = bounds.getNorth(), e = bounds.getEast();
+    const subs = APPLE_BRANDS.map(br=>brandToOverpassSub(br,[s,w,n,e])).join('\n');
+    return `
+[out:json][timeout:25];
+(
+${subs}
+);
+out ${CFG.LIMIT} center;
+`;
+  }
+
+  // =========================
+  // Map
+  // =========================
+  const map = L.map('map', { zoomControl:true, scrollWheelZoom:true }).setView(CFG.CENTER, CFG.INIT_ZOOM);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    maxZoom:19
+  }).addTo(map);
+
+  const layer = L.layerGroup().addTo(map);
+  const seen = new Set(); // 중복 방지(osm id)
+
+  let debounceTimer=null, lastFetchAt=0, inFlight=false;
+  function scheduleLoad(delay=350){
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(()=> loadInView(), delay);
+  }
+
+  async function loadInView(){
+    if(inFlight) return;
+    inFlight = true;
+    try{
+      const now = Date.now();
+      if(now - lastFetchAt < 500) { inFlight=false; return; }
+      lastFetchAt = now;
+
+      const bounds = map.getBounds();
+      toast('애플페이 가맹점 불러오는 중…');
+      const data = await fetchOverpass(buildQueryForBrands(bounds));
+
+      let added = 0;
+      (data.elements||[]).forEach(el=>{
+        const { id, tags={} } = el;
+        const lat = el.lat ?? el.center?.lat;
+        const lon = el.lon ?? el.center?.lon;
+        if(!isFinite(lat) || !isFinite(lon)) return;
+        if(seen.has(id)) return; seen.add(id);
+
+        // 어떤 브랜드 규칙에 매칭됐는지 찾아 라벨 결정
+        let brSpec = APPLE_BRANDS.find(br=>{
+          const filtOK = Object.entries(br.filter||{}).every(([k,v]) => tags[k] === v);
+          const mBrand = br.brandRE ? br.brandRE.test(tags.brand||'') : false;
+          const mName  = br.nameRE  ? br.nameRE.test(tags.name||'')  : false;
+          return filtOK && (mBrand || mName);
+        });
+        if(!brSpec) return;
+
+        const title = tags.name || tags.brand || brSpec.id.toUpperCase();
+        const brandText = tags.brand ? `브랜드: ${esc(tags.brand)}` : '';
+        const addr = addrFromTags(tags);
+        const addrRow = addr ? `<div class="row">주소: ${esc(addr)}</div>` : `<div class="row">좌표: ${lat.toFixed(6)}, ${lon.toFixed(6)}</div>`;
+
+        L.marker([lat, lon], { icon: iconFor(brSpec.icon) })
+         .bindPopup(`
+           <div class="popup">
+             <div class="title">${esc(title)}</div>
+             ${brandText ? `<div class="row">${brandText}</div>`:''}
+             ${addrRow}
+             <div class="row">애플페이: <b>지원(브랜드 지정)</b></div>
+             <div class="row">분류: ${esc(brSpec.label)}</div>
+           </div>
+         `)
+         .bindTooltip(`${brSpec.label}`, {direction:'top', offset:[0,-8]})
+         .addTo(layer);
+        added++;
+      });
+
+      toast(added ? `표시됨: ${added}곳` : '현재 화면에 표시할 항목이 없어요');
+    }catch(e){
+      console.error(e);
+      toast('불러오기에 실패했어요 (Overpass 상태/네트워크)');
+    }finally{
+      inFlight=false;
+    }
+  }
+
+  // =========================
+  // Search (현재 표출 마커 필터)
+  // =========================
+  function filterVisible(q){
+    q = (q||'').trim().toLowerCase();
+    layer.eachLayer(m=>{
+      const html = m.getPopup()?.getContent() || '';
+      const ok = !q || html.toLowerCase().includes(q);
+      if(ok){ m.addTo(layer); } else { layer.removeLayer(m); }
+    });
+  }
+  $('#search-submit').addEventListener('click', ()=> filterVisible($('#search').value));
+  $('#search').addEventListener('keydown', e=>{ if(e.key==='Enter') filterVisible(e.target.value); });
+
+  // =========================
+  // Buttons & UX
+  // =========================
+  $('#btn-geoloc').addEventListener('click', geolocateAndLoad);
+  $('#btn-scan').addEventListener('click', ()=> { scheduleLoad(0); });
+  $('#btn-center').addEventListener('click', ()=>{
+    map.setView(CFG.CENTER, CFG.INIT_ZOOM);
+    scheduleLoad(0);
+  });
+  $('#btn-add').addEventListener('click', ()=>{
+    const once = e=>{
+      const { lat, lng } = e.latlng;
+      openIssueWith(lat, lng);
+      map.off('click', once);
+    };
+    toast('지도에서 위치를 클릭하세요. 깃허브 이슈가 열립니다');
+    map.once('click', once);
+  });
+
+  function openIssueWith(lat, lon){
+    const base = `https://github.com/${encodeURIComponent(CFG.OWNER)}/${encodeURIComponent(CFG.REPO)}/issues/new`;
+    const params = new URLSearchParams();
+    params.set('title', '[Add] Apple Pay Merchant');
+    params.set('labels', CFG.ISSUE_LABEL);
+    const body = [
+      '**상호명**\n',
+      '**카테고리**\nconv / cafe / resto / mart / bakery / pharmacy / transport / other\n',
+      '**위도/경도**\n', `lat: ${lat}\nlon: ${lon}\n`,
+      '**애플페이** (해당에 체크)\n', '- [ ] Contactless\n- [ ] In-App\n- [ ] Express\n',
+      '**비고/출처(선택)**\n'
+    ].join('\n');
+    params.set('body', body);
+    window.open(`${base}?${params.toString()}`, '_blank');
+  }
+
+  // 화면 이동할 때마다 자동 로딩(과호출 방지 디바운스)
+  map.on('moveend', ()=> scheduleLoad(300));
+
+  // =========================
+  // Auto start: 내 위치 → 현재 화면 로딩
+  // =========================
+  function geolocateAndLoad(){
+    if(!navigator.geolocation){
+      map.setView(CFG.CENTER, CFG.INIT_ZOOM);
+      scheduleLoad(0);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(pos=>{
+      const { latitude:lat, longitude:lon } = pos.coords;
+      map.setView([lat,lon], 16);
+      scheduleLoad(0);
+    }, ()=>{
+      map.setView(CFG.CENTER, CFG.INIT_ZOOM);
+      scheduleLoad(0);
+    }, { enableHighAccuracy:true, timeout:8000, maximumAge:30000 });
+  }
+  geolocateAndLoad();
+  </script>
+</body>
+</html>
